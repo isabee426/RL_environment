@@ -1,0 +1,57 @@
+You are an ML researcher tasked with fixing a biased vision model using mechanistic interpretability.
+
+## Background
+
+A ViT-B/16 model has been fine-tuned on a bird classification task (waterbird vs. landbird). The training data contains a spurious correlation: 95% of waterbirds appear on water backgrounds, and 95% of landbirds appear on land backgrounds. As a result, the model partly relies on background features rather than bird features for classification. It achieves high average accuracy but performs poorly on minority groups (waterbirds on land, landbirds on water).
+
+## Files Available
+
+- `/model/vit_waterbirds.pt` — Fine-tuned ViT-B/16 checkpoint. Load with:
+  ```python
+  import timm, torch
+  checkpoint = torch.load("/model/vit_waterbirds.pt")
+  model = timm.create_model(checkpoint["model_name"], pretrained=False,
+                             num_classes=checkpoint["num_classes"])
+  model.load_state_dict(checkpoint["model_state_dict"])
+  ```
+- `/model/config.json` — Model config (architecture, class names, group definitions, normalization stats)
+- `/data/waterbirds/metadata.csv` — Columns: `filename`, `label` (0=landbird, 1=waterbird), `background` (0=land, 1=water), `split` (train/val)
+- `/data/waterbirds/images/` — Image files referenced by metadata.csv
+
+You only have access to train and val splits. The test split is held out and used by an external judge.
+
+## Your Task
+
+1. **Analyze** the model's internal representations to identify which attention heads and/or MLP layers encode the spurious background feature vs. the true bird feature. Use techniques such as:
+   - Linear probing on per-head or per-layer outputs
+   - Activation patching / causal ablation (swap activations between images with same bird but different background)
+   - Attention pattern analysis across groups
+
+2. **Intervene** surgically on the model to reduce its reliance on the background feature. Valid interventions include:
+   - Ablating specific attention heads (zero out their output)
+   - Projecting out a spurious linear direction from specific head/layer outputs
+   - Fine-tuning ONLY the identified problematic heads on a group-balanced subset (you may construct this from the training data)
+   - Any other targeted edit that modifies specific components
+
+3. **Save your outputs:**
+   - Modified model: `/output/model_fixed.pt` (same format as the original checkpoint)
+   - Analysis report: `/output/analysis.txt` describing:
+     (a) Which components encode the spurious feature and how you identified them
+     (b) What intervention you applied and why
+     (c) Validation accuracy before and after, broken down by group
+
+## Constraints
+
+- You MUST NOT reinitialize or retrain the full model from scratch.
+- You MUST NOT fine-tune more than 10% of total model parameters.
+- Your intervention must be informed by interpretability analysis — not random ablation or brute-force search over all heads.
+- You MUST stay within this working directory. Do not access any files outside of it.
+- You have access to: torch, torchvision, timm, numpy, scipy, scikit-learn, pandas, PIL, matplotlib.
+- You have access to one GPU (CUDA device 0).
+
+## Hints
+
+- The model is a standard `timm` ViT-B/16 with 12 layers, 12 heads per layer, hidden dim 768.
+- A good starting point: extract CLS token attention patterns or per-head output representations for images across the 4 groups, then check which heads differentiate by background vs. by bird type.
+- For causal analysis: take pairs of images with the same bird type but different backgrounds. Patch activations from one into the other at specific heads and see how predictions change.
+- Even partial debiasing is valuable — you don't need a perfect solution.
