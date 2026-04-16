@@ -2,7 +2,6 @@
 
 An RL environment for training LLM agents on frontier ML research tasks. The agent must implement **skip transcoders** — a mechanistic interpretability technique from [Paulo et al. 2025](https://arxiv.org/abs/2501.18823) that has only been applied to language models — and adapt it to a **vision transformer**.
 
-Built as a technical assessment for [Preference Model](https://www.preferencemodel.com/).
 
 ## Why This Environment
 
