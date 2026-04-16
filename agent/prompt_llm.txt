@@ -13,7 +13,7 @@ You must find what makes Bash *specifically* different from other languages in t
 
 ## Warning: Shallow Forgetting
 
-The judge tests not just output behavior but also **internal representations**. It trains linear probes on your unlearned model's hidden states to check whether Python knowledge is still latently encoded. Known failure modes:
+The judge tests not just output behavior but also **internal representations**. It trains linear probes on your unlearned model's hidden states to check whether Bash knowledge is still latently encoded. Known failure modes:
 - **Surface suppression**: Modifying only the output head or last layer — probes on earlier layers will detect the knowledge still exists
 - **Knowledge inversion**: Model produces anti-Bash output instead of genuinely forgetting — still encodes the capability, just with flipped sign
 - **Collateral damage**: Removing too much destroys other languages too
@@ -24,29 +24,29 @@ Genuine unlearning means the internal representations no longer encode the capab
 ## Files Available
 
 - `./model/config.json` — Model config with baseline pass rates, architecture details, and compiler availability
-- `./data/coding_problems.json` — 5 coding problems, each with Rust/Python/JS/C++ prompts and correctness tests
+- `./data/humaneval_problems.json` — 20 HumanEval coding problems with prompts and unit tests
 - `./data/general_tests.json` — Non-coding tests (math, reasoning, knowledge) to verify general capability
 
-The model is Qwen2.5-3B, loaded directly from HuggingFace:
+The model is Qwen2.5-Coder-7B-Instruct, loaded directly from HuggingFace:
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
 model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-Coder-7B-Instruct", torch_dtype=torch.bfloat16, device_map="auto")
 tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Coder-7B-Instruct")
 ```
 
-The server has `rustc`, `python3`, `node`, and `g++` available for testing generated code.
+The server has `python3`, `g++`, and `bash` available for testing generated code.
 
 ## Your Task
 
-1. **Baseline**: Evaluate the model on all coding problems in all 4 languages + general tests. Establish what it can do.
+1. **Baseline**: Evaluate the model on coding problems (Python via HumanEval, Bash scripts, C++) + general tests. Establish what it can do.
 
-2. **Localize**: Find where Rust-specific capability lives in the model. You decide the approach:
+2. **Localize**: Find where Bash-specific capability lives in the model. You decide the approach:
    - Compare activations when generating Bash vs. Python/C++ for the same task
    - Probe layers to find where "language identity" is encoded
    - Use activation patching: swap activations between Bash and Python generation to find which layers determine the output language
    - Analyze which attention heads attend to Bash-specific syntax tokens (`$`, `|`, `&&`, `#!/bin/bash`, `echo`, `grep`, `awk`, backticks)
 
-3. **Unlearn**: Remove Rust coding capability. You decide the method:
+3. **Unlearn**: Remove Bash coding capability. You decide the method:
    - Project out the "Bash direction" from specific layers
    - Ablate components that encode Bash-specific knowledge
    - Fine-tune to map Bash prompts to refusal or incorrect output while anchoring all other capabilities
@@ -55,7 +55,7 @@ The server has `rustc`, `python3`, `node`, and `g++` available for testing gener
 
 4. **Verify**: Test thoroughly:
    - Bash: model should fail to produce working Bash scripts
-   - All other available languages (C++, Java, Rust, JavaScript, Go, Bash — whatever is on the system): model should still produce correct code
+   - Python and C++: model should still produce correct code
    - General: math, reasoning, knowledge, translation, code explanation should be unaffected
    - Collateral check: does removing Bash hurt Python or system administration knowledge? (the model should still understand Unix concepts, just not write shell scripts)
    - Check `./model/config.json` for the list of available compilers and baseline pass rates per language
@@ -67,11 +67,11 @@ The server has `rustc`, `python3`, `node`, and `g++` available for testing gener
      ```json
      {
        "method": "description of localization approach",
-       "rust_specific_components": {
+       "bash_specific_components": {
          "layers": [list],
          "description": "what you found"
        },
-       "evidence": "how you verified these components are Rust-specific and not general coding"
+       "evidence": "how you verified these components are Bash-specific and not general coding"
      }
      ```
    - Analysis: `./output/analysis.txt` describing:
@@ -90,5 +90,5 @@ The server has `rustc`, `python3`, `node`, and `g++` available for testing gener
 - You MUST stay within this working directory.
 - You have: torch, transformers, peft, accelerate, numpy, scipy, scikit-learn, datasets.
 - You have one GPU (CUDA device 0).
-- You have compilers: rustc, python3, node, g++.
+- You have compilers/interpreters: python3, g++, bash.
 - Do not download additional models.

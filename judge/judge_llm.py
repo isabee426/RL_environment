@@ -1,13 +1,13 @@
 """
-Judge: Capability Unlearning — Rust Removal from Qwen2.5-3B
-============================================================
+Judge: Capability Unlearning — Bash Removal from Qwen2.5-Coder-7B
+==================================================================
 Tests the unlearned model on held-out coding problems.
 
 Scoring:
-  - Forget (Rust): fraction of Rust problems the model can NO LONGER solve
-  - Retain (Python/JS/C++): fraction still solved correctly
+  - Forget (Bash): fraction of Bash tasks the model can NO LONGER solve
+  - Retain (Python/C++): fraction still solved correctly
   - General: non-coding tests still pass
-  - Collateral: C++ specifically (closest to Rust)
+  - Internal probing: shallow forgetting detection
 
 Usage:
     CUDA_VISIBLE_DEVICES=1 python3 judge/judge_llm.py --env_root /data3/ishaplan/pref_model_env_llm
@@ -355,8 +355,8 @@ def main():
     results["details"]["original_general"] = orig_general
     results["details"]["unlearned_general"] = unlearned_general
 
-    forget_lang = config.get("forget_language", "python")
-    retain_langs = config.get("retain_languages", ["rust", "javascript", "cpp"])
+    forget_lang = config.get("forget_language", config.get("forget_capability", "bash_code_generation").replace("_code_generation", ""))
+    retain_langs = config.get("retain_languages", ["python", "cpp"])
 
     # ---- Forget score ----
     if orig_scores[forget_lang] > 0:
@@ -483,7 +483,7 @@ def main():
             with open(localization_path) as f:
                 loc = json.load(f)
             if loc.get("method"): localization_score += 0.3
-            if loc.get("rust_specific_components") or loc.get("python_specific_components"): localization_score += 0.3
+            if loc.get("bash_specific_components") or loc.get("rust_specific_components") or loc.get("python_specific_components"): localization_score += 0.3
             if loc.get("evidence"): localization_score += 0.4
         except Exception:
             pass
@@ -513,8 +513,7 @@ def main():
     results["reason"] = (
         f"Score: {final_score:.2f}/1.0 | "
         f"Python: {orig_scores.get('python',0):.0%}->{unlearned_scores.get('python',0):.0%} | "
-        f"Rust: {orig_scores.get('rust',0):.0%}->{unlearned_scores.get('rust',0):.0%} | "
-        f"JS: {orig_scores.get('javascript',0):.0%}->{unlearned_scores.get('javascript',0):.0%} | "
+        f"Bash: {orig_scores.get('bash',0):.0%}->{unlearned_scores.get('bash',0):.0%} | "
         f"C++: {orig_scores.get('cpp',0):.0%}->{unlearned_scores.get('cpp',0):.0%} | "
         f"Shallow penalty: {shallow_penalty:.2f} | "
         f"General: {unlearned_general:.0%}"
