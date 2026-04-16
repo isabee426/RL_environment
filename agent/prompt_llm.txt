@@ -85,7 +85,7 @@ The server has `python3`, `g++`, and `bash` available for testing generated code
 ## Constraints
 
 - You MUST use interpretability to inform your unlearning — not blind approaches.
-- Retain language pass rates must stay within 15% of baseline.
+- Retain language pass rates must stay within 5% of baseline.
 - General capability tests must all still pass.
 - You MUST stay within this working directory.
 - You have: torch, transformers, peft, accelerate, numpy, scipy, scikit-learn, datasets.
