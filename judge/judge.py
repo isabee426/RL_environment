@@ -1,16 +1,15 @@
 """
-Judge: Transcoders on Vision Transformers
-=========================================
-Evaluates the agent's transcoder against the baseline SAE on the held-out test set.
+Judge: Mechanistic Unlearning
+=============================
+Evaluates the agent's unlearned model on held-out test images.
 
-Scoring (0.0 - 1.0):
-  1. Architecture check: is it actually a skip transcoder? (pass/fail gate)
-  2. Reconstruction quality: MSE on test MLP outputs (must beat or match baseline SAE)
-  3. Sparsity: L0 must be in [20, 50] range (TopK=32 target)
-  4. Interpretability: per-concept AUROC on test set
-  5. Comparison: how many concepts does the transcoder beat the SAE on?
-
-Final score = weighted combination of reconstruction + interpretability + comparison.
+Scoring:
+  - Forget score (0-1): How well were target concepts erased?
+    Per-concept: 1.0 if accuracy <= 55%, 0.0 if accuracy >= original, linear between
+  - Retain score (0-1): How well were other concepts preserved?
+    Per-concept: 1.0 if accuracy within 5% of original, 0.0 if dropped >20%, linear between
+  - Localization score (0-1): Did the agent provide causal evidence for localization?
+  - Final score: 0.35 * forget + 0.35 * retain + 0.15 * localization + 0.15 * has_all_outputs
 
 Usage:
     CUDA_VISIBLE_DEVICES=1 python3 judge/judge.py --env_root /data3/ishaplan/pref_model_env
@@ -24,194 +23,78 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from sklearn.metrics import roc_auc_score
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+from sklearn.metrics import accuracy_score
 
 
-def load_transcoder(checkpoint_path):
-    """Load the agent's transcoder and verify it has skip transcoder architecture."""
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+class TestDataset(Dataset):
+    def __init__(self, img_dir, filenames, transform):
+        self.img_dir = Path(img_dir)
+        self.filenames = filenames
+        self.transform = transform
 
-    state_dict = checkpoint.get("state_dict", checkpoint)
-    architecture = checkpoint.get("architecture", "unknown")
-    input_dim = checkpoint.get("input_dim", 768)
-    output_dim = checkpoint.get("output_dim", 768)
-    dict_size = checkpoint.get("dict_size", None)
-    topk = checkpoint.get("topk", 32)
+    def __len__(self):
+        return len(self.filenames)
 
-    # Check for skip transcoder components
-    has_skip = any("skip" in k.lower() for k in state_dict.keys())
-    has_encoder = any("enc" in k.lower() for k in state_dict.keys())
-    has_decoder = any("dec" in k.lower() for k in state_dict.keys())
-
-    return {
-        "state_dict": state_dict,
-        "architecture": architecture,
-        "input_dim": input_dim,
-        "output_dim": output_dim,
-        "dict_size": dict_size,
-        "topk": topk,
-        "has_skip": has_skip,
-        "has_encoder": has_encoder,
-        "has_decoder": has_decoder,
-        "param_keys": list(state_dict.keys()),
-    }
+    def __getitem__(self, idx):
+        img = Image.open(self.img_dir / self.filenames[idx]).convert("RGB")
+        return self.transform(img), idx
 
 
-class GenericTranscoder(nn.Module):
-    """Flexible loader for the agent's transcoder."""
-    def __init__(self, state_dict, input_dim, output_dim, dict_size):
-        super().__init__()
-        # Try to reconstruct the architecture from state dict keys
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.dict_size = dict_size
+def load_model(checkpoint_path, device):
+    """Load a CLIPConceptClassifier from checkpoint."""
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-        # Create layers matching the state dict
-        for key, param in state_dict.items():
-            name = key.replace(".", "_")
-            if param.dim() >= 2:
-                setattr(self, name, nn.Linear(param.shape[1], param.shape[0], bias=False))
-            else:
-                self.register_buffer(name, param)
+    try:
+        import open_clip
+        clip_model, _, _ = open_clip.create_model_and_transforms("ViT-B-16", pretrained="openai")
+        visual = clip_model.visual
+    except ImportError:
+        import timm
+        visual = timm.create_model("vit_base_patch16_224", pretrained=True)
 
-        # Load the state dict
-        self.load_state_dict(state_dict, strict=False)
+    class CLIPConceptClassifier(nn.Module):
+        def __init__(self, visual, num_concepts):
+            super().__init__()
+            self.visual = visual
+            self.head = nn.Linear(512, num_concepts)
+        def forward(self, x):
+            features = self.visual(x)
+            if features.dim() == 3:
+                features = features[:, 0, :]
+            return self.head(features)
 
-    def forward(self, x):
-        raise NotImplementedError("Use the agent's own forward pass")
-
-
-def find_params(state_dict):
-    """Flexibly find encoder/decoder/skip params regardless of naming convention.
-
-    Handles both 'W_enc'/'b_enc' style and 'encoder.weight'/'encoder.bias' style.
-    """
-    enc_weight = enc_bias = dec_weight = dec_bias = skip_weight = skip_bias = None
-
-    for key, param in state_dict.items():
-        k = key.lower()
-        # Encoder: W_enc, encoder.weight, enc_weight, etc.
-        if ("w_enc" == k or (("enc" in k or "encoder" in k) and ("weight" in k or param.dim() == 2)))  \
-           and "dec" not in k and "skip" not in k and enc_weight is None:
-            enc_weight = param
-        elif ("b_enc" == k or (("enc" in k or "encoder" in k) and ("bias" in k or param.dim() == 1))) \
-             and "dec" not in k and "skip" not in k and enc_bias is None:
-            enc_bias = param
-        # Decoder: W_dec, decoder.weight, dec_weight, etc.
-        elif ("w_dec" == k or (("dec" in k or "decoder" in k) and ("weight" in k or param.dim() == 2))) \
-             and "enc" not in k and "skip" not in k and dec_weight is None:
-            dec_weight = param
-        elif ("b_dec" == k or (("dec" in k or "decoder" in k) and ("bias" in k or param.dim() == 1))) \
-             and "enc" not in k and "skip" not in k and dec_bias is None:
-            dec_bias = param
-        # Skip: W_skip, skip.weight, etc.
-        elif ("w_skip" == k or ("skip" in k and ("weight" in k or param.dim() == 2))) \
-             and skip_weight is None:
-            skip_weight = param
-        elif ("b_skip" == k or ("skip" in k and ("bias" in k or param.dim() == 1))) \
-             and skip_bias is None:
-            skip_bias = param
-
-    return enc_weight, enc_bias, dec_weight, dec_bias, skip_weight, skip_bias
+    model = CLIPConceptClassifier(visual, checkpoint["num_concepts"])
+    model.load_state_dict(checkpoint["state_dict"])
+    model = model.to(device)
+    model.eval()
+    return model
 
 
-def compute_feature_activations(state_dict, inputs, topk, device):
-    """Run the transcoder encoder to get sparse feature activations."""
-    enc_weight, enc_bias, _, _, _, _ = find_params(state_dict)
+def evaluate_concepts(model, dataloader, labels_df, concept_cols, device):
+    """Evaluate per-concept binary accuracy."""
+    all_logits = []
+    with torch.no_grad():
+        for imgs, indices in dataloader:
+            imgs = imgs.to(device)
+            logits = model(imgs)
+            all_logits.append(logits.cpu())
 
-    if enc_weight is None:
-        return None
+    all_logits = torch.cat(all_logits, dim=0)
+    preds = (all_logits > 0).float().numpy()
+    labels = labels_df[concept_cols].values.astype(float)
 
-    enc_weight = enc_weight.to(device)
-    if enc_bias is not None:
-        enc_bias = enc_bias.to(device)
-
-    x = torch.tensor(inputs, dtype=torch.float32).to(device)
-    z_pre = x @ enc_weight.T
-    if enc_bias is not None:
-        z_pre = z_pre + enc_bias
-
-    # TopK
-    topk_vals, topk_idx = torch.topk(z_pre, topk, dim=-1)
-    z = torch.zeros_like(z_pre)
-    z.scatter_(-1, topk_idx, torch.relu(topk_vals))
-
-    return z.cpu().numpy()
-
-
-def compute_reconstruction(state_dict, inputs, topk, device):
-    """Reconstruct MLP outputs from MLP inputs using the transcoder."""
-    enc_weight, enc_bias, dec_weight, dec_bias, skip_weight, skip_bias = find_params(state_dict)
-
-    if enc_weight is None or dec_weight is None:
-        return None
-
-    enc_weight = enc_weight.to(device)
-    if enc_bias is not None: enc_bias = enc_bias.to(device)
-    dec_weight = dec_weight.to(device)
-    if dec_bias is not None: dec_bias = dec_bias.to(device)
-    if skip_weight is not None: skip_weight = skip_weight.to(device)
-    if skip_bias is not None: skip_bias = skip_bias.to(device)
-
-    x = torch.tensor(inputs, dtype=torch.float32).to(device)
-
-    # Encode
-    z_pre = x @ enc_weight.T
-    if enc_bias is not None:
-        z_pre = z_pre + enc_bias
-
-    # TopK
-    topk_vals, topk_idx = torch.topk(z_pre, topk, dim=-1)
-    z = torch.zeros_like(z_pre)
-    z.scatter_(-1, topk_idx, torch.relu(topk_vals))
-
-    # Decode
-    x_hat = z @ dec_weight.T
-    if dec_bias is not None:
-        x_hat = x_hat + dec_bias
-
-    # Skip connection
-    if skip_weight is not None:
-        x_hat = x_hat + x @ skip_weight.T
-        if skip_bias is not None:
-            x_hat = x_hat + skip_bias
-
-    return x_hat.cpu().numpy()
-
-
-def compute_interpretability(activations, concept_labels, min_positive=10):
-    """Compute per-concept best AUROC from feature activations."""
-    concepts = concept_labels.columns.tolist()
-    results = {}
-
-    for concept in concepts:
-        labels = concept_labels[concept].values
-        n_pos = labels.sum()
-        n_neg = len(labels) - n_pos
-
-        if n_pos < min_positive or n_neg < min_positive:
+    per_concept_acc = {}
+    for i, concept in enumerate(concept_cols):
+        y_true = labels[:, i]
+        y_pred = preds[:, i]
+        if y_true.sum() < 5 or (1 - y_true).sum() < 5:
             continue
+        per_concept_acc[concept] = round(float(accuracy_score(y_true, y_pred)), 4)
 
-        best_auroc = 0.0
-        best_feat = -1
-
-        for feat_idx in range(activations.shape[1]):
-            feat_acts = activations[:, feat_idx]
-            if feat_acts.std() < 1e-8:
-                continue
-            try:
-                auroc = roc_auc_score(labels, feat_acts)
-                auroc = max(auroc, 1 - auroc)  # handle flipped features
-                if auroc > best_auroc:
-                    best_auroc = auroc
-                    best_feat = feat_idx
-            except ValueError:
-                continue
-
-        if best_feat >= 0:
-            results[concept] = {"feature_idx": int(best_feat), "auroc": round(best_auroc, 4)}
-
-    return results
+    return per_concept_acc
 
 
 def main():
@@ -222,202 +105,199 @@ def main():
     env_root = Path(args.env_root)
     judge_dir = env_root / ".judge"
     output_dir = env_root / "output"
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    results = {
-        "score": 0.0,
-        "reason": "",
-        "details": {},
-    }
+    results = {"score": 0.0, "reason": "", "details": {}}
 
     # ---- Check 1: Required files ----
-    transcoder_path = output_dir / "transcoder.pt"
-    mapping_path = output_dir / "feature_mapping.json"
+    unlearned_path = output_dir / "unlearned_model.pt"
+    localization_path = output_dir / "localization.json"
     analysis_path = output_dir / "analysis.txt"
 
-    for path, name in [(transcoder_path, "transcoder.pt"),
-                       (mapping_path, "feature_mapping.json"),
-                       (analysis_path, "analysis.txt")]:
-        if not path.exists():
-            results["reason"] = f"FAIL: /output/{name} not found"
-            print(json.dumps(results, indent=2))
-            return
-
-    # ---- Check 2: Architecture verification ----
-    try:
-        tc_info = load_transcoder(transcoder_path)
-    except Exception as e:
-        results["reason"] = f"FAIL: Could not load transcoder: {e}"
-        print(json.dumps(results, indent=2))
-        return
-
-    results["details"]["architecture"] = {
-        "declared": tc_info["architecture"],
-        "has_skip_connection": tc_info["has_skip"],
-        "has_encoder": tc_info["has_encoder"],
-        "has_decoder": tc_info["has_decoder"],
-        "dict_size": tc_info["dict_size"],
-        "param_keys": tc_info["param_keys"],
-    }
-
-    if not tc_info["has_encoder"] or not tc_info["has_decoder"]:
-        results["reason"] = "FAIL: Transcoder missing encoder or decoder components"
-        print(json.dumps(results, indent=2))
-        return
-
-    if not tc_info["has_skip"]:
-        results["reason"] = (
-            "FAIL: No skip connection found in transcoder. "
-            "A skip transcoder must have W_skip parameters."
-        )
-        results["score"] = 0.1  # partial credit for attempting
-        print(json.dumps(results, indent=2))
-        return
-
-    if tc_info["dict_size"] is not None and tc_info["dict_size"] < 4096:
-        results["reason"] = (
-            f"FAIL: Dictionary size {tc_info['dict_size']} < 4096 minimum"
-        )
-        print(json.dumps(results, indent=2))
-        return
-
-    # ---- Check 3: Reconstruction quality on test set ----
-    test_inputs = np.load(judge_dir / "mlp_inputs_test.npy")
-    test_outputs = np.load(judge_dir / "mlp_outputs_test.npy")
-    concept_labels_test = pd.read_csv(judge_dir / "concept_labels_test.csv")
-
-    with open(judge_dir / "judge_meta.json") as f:
-        judge_meta = json.load(f)
-    baseline_mse = judge_meta["baseline_sae_mse"]
-
-    # Reconstruct with transcoder
-    topk = tc_info.get("topk", 32)
-    recon = compute_reconstruction(tc_info["state_dict"], test_inputs, topk, device)
-
-    if recon is None:
-        results["reason"] = "FAIL: Could not run transcoder forward pass"
-        print(json.dumps(results, indent=2))
-        return
-
-    tc_mse = float(((test_outputs - recon) ** 2).mean())
-    output_var = float(test_outputs.var())
-    normalized_mse = tc_mse / max(output_var, 1e-8)
-
-    results["details"]["reconstruction"] = {
-        "transcoder_mse": round(tc_mse, 6),
-        "baseline_sae_mse": round(baseline_mse, 6),
-        "output_variance": round(output_var, 6),
-        "normalized_mse": round(normalized_mse, 6),
-        "beats_baseline": tc_mse < baseline_mse,
-    }
-
-    # ---- Check 4: Sparsity ----
-    tc_activations = compute_feature_activations(
-        tc_info["state_dict"], test_inputs, topk, device
-    )
-
-    if tc_activations is None:
-        results["reason"] = "FAIL: Could not compute transcoder feature activations"
-        print(json.dumps(results, indent=2))
-        return
-
-    avg_l0 = float((tc_activations > 0).sum(axis=1).mean())
-    results["details"]["sparsity"] = {
-        "avg_l0": round(avg_l0, 1),
-        "target_l0": topk,
-        "in_range": 20 <= avg_l0 <= 50,
-    }
-
-    # ---- Check 5: Interpretability ----
-    # Transcoder features
-    tc_interp = compute_interpretability(tc_activations, concept_labels_test)
-
-    # Baseline SAE features
-    baseline_activations = np.load(judge_dir / "baseline_sae_activations.npy")
-    sae_interp = compute_interpretability(baseline_activations, concept_labels_test)
-
-    results["details"]["interpretability"] = {
-        "transcoder_concepts_found": len(tc_interp),
-        "baseline_sae_concepts_found": len(sae_interp),
-    }
-
-    # Compare per-concept
-    shared_concepts = set(tc_interp.keys()) & set(sae_interp.keys())
-    tc_wins = 0
-    sae_wins = 0
-    per_concept = {}
-
-    for concept in shared_concepts:
-        tc_auroc = tc_interp[concept]["auroc"]
-        sae_auroc = sae_interp[concept]["auroc"]
-        per_concept[concept] = {
-            "transcoder_auroc": tc_auroc,
-            "baseline_sae_auroc": sae_auroc,
-            "winner": "transcoder" if tc_auroc > sae_auroc else "baseline_sae",
-        }
-        if tc_auroc > sae_auroc:
-            tc_wins += 1
+    output_score = 0.0
+    for path, name, weight in [
+        (unlearned_path, "unlearned_model.pt", 0.6),
+        (localization_path, "localization.json", 0.2),
+        (analysis_path, "analysis.txt", 0.2),
+    ]:
+        if path.exists():
+            output_score += weight
         else:
-            sae_wins += 1
+            results["details"][f"missing_{name}"] = True
 
-    results["details"]["comparison"] = {
-        "shared_concepts": len(shared_concepts),
-        "transcoder_wins": tc_wins,
-        "baseline_sae_wins": sae_wins,
-        "win_rate": round(tc_wins / max(len(shared_concepts), 1), 4),
-        "per_concept": per_concept,
+    if not unlearned_path.exists():
+        results["reason"] = "FAIL: /output/unlearned_model.pt not found"
+        print(json.dumps(results, indent=2))
+        return
+
+    results["details"]["output_completeness"] = round(output_score, 2)
+
+    # ---- Check 2: Load config ----
+    with open(judge_dir / "judge_config.json") as f:
+        config = json.load(f)
+
+    forget_concepts = config["forget_concepts"]
+    retain_concepts = config["retain_concepts"]
+    concept_cols = config["concept_cols"]
+
+    # ---- Check 3: Load test data ----
+    test_labels = pd.read_csv(judge_dir / "test_labels.csv")
+    test_filenames = test_labels["filename"].tolist()
+
+    transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize([0.48145466, 0.4578275, 0.40821073],
+                             [0.26862954, 0.26130258, 0.27577711]),
+    ])
+
+    test_ds = TestDataset(judge_dir / "images", test_filenames, transform)
+    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False, num_workers=4)
+
+    # ---- Check 4: Evaluate original model ----
+    print("Evaluating original model...")
+    original_model = load_model(judge_dir / "original_model.pt", device)
+    original_accs = evaluate_concepts(original_model, test_loader, test_labels, concept_cols, device)
+    original_model = original_model.cpu()
+
+    results["details"]["original_model"] = {
+        "forget_accs": {c: original_accs.get(c, 0) for c in forget_concepts},
+        "retain_accs_mean": round(np.mean([original_accs.get(c, 0) for c in retain_concepts if c in original_accs]), 4),
     }
 
-    # ---- Compute final score ----
-    # Reconstruction score (0-0.3): how good is MSE relative to baseline
-    if tc_mse <= baseline_mse * 0.8:
-        recon_score = 0.3  # significantly better
-    elif tc_mse <= baseline_mse:
-        recon_score = 0.2  # better or equal
-    elif tc_mse <= baseline_mse * 1.5:
-        recon_score = 0.1  # somewhat worse but reasonable
-    else:
-        recon_score = 0.0  # much worse
+    # ---- Check 5: Evaluate unlearned model ----
+    print("Evaluating unlearned model...")
+    try:
+        unlearned_model = load_model(unlearned_path, device)
+    except Exception as e:
+        results["reason"] = f"FAIL: Could not load unlearned model: {e}"
+        print(json.dumps(results, indent=2))
+        return
 
-    # Sparsity score (0-0.1)
-    sparsity_score = 0.1 if 20 <= avg_l0 <= 50 else 0.0
+    unlearned_accs = evaluate_concepts(unlearned_model, test_loader, test_labels, concept_cols, device)
+    unlearned_model = unlearned_model.cpu()
 
-    # Interpretability score (0-0.3): average AUROC across concepts
-    if tc_interp:
-        avg_tc_auroc = np.mean([v["auroc"] for v in tc_interp.values()])
-        interp_score = min(0.3, (avg_tc_auroc - 0.5) * 1.5)  # scale 0.5-0.7 -> 0-0.3
-        interp_score = max(0.0, interp_score)
-    else:
-        interp_score = 0.0
+    # ---- Check 6: Forget score ----
+    forget_scores = []
+    forget_details = {}
+    for concept in forget_concepts:
+        orig = original_accs.get(concept, 0.5)
+        unlearned = unlearned_accs.get(concept, 0.5)
 
-    # Comparison score (0-0.3): what fraction of concepts does transcoder beat SAE
-    if shared_concepts:
-        win_rate = tc_wins / len(shared_concepts)
-        comparison_score = win_rate * 0.3
-    else:
-        comparison_score = 0.0
+        # Score: 1.0 if accuracy <= 55% (near chance), 0.0 if >= original
+        if unlearned <= 0.55:
+            score = 1.0
+        elif unlearned >= orig:
+            score = 0.0
+        else:
+            score = (orig - unlearned) / (orig - 0.55)
+            score = max(0.0, min(1.0, score))
 
-    final_score = recon_score + sparsity_score + interp_score + comparison_score
+        forget_scores.append(score)
+        forget_details[concept] = {
+            "original_acc": orig,
+            "unlearned_acc": unlearned,
+            "score": round(score, 4),
+        }
+
+    avg_forget = np.mean(forget_scores) if forget_scores else 0.0
+    results["details"]["forget"] = {
+        "per_concept": forget_details,
+        "avg_score": round(avg_forget, 4),
+    }
+
+    # ---- Check 7: Retain score ----
+    retain_scores = []
+    retain_details = {}
+    for concept in retain_concepts:
+        if concept not in original_accs or concept not in unlearned_accs:
+            continue
+        orig = original_accs[concept]
+        unlearned = unlearned_accs[concept]
+        drop = orig - unlearned
+
+        # Score: 1.0 if drop <= 5%, 0.0 if drop >= 20%
+        if drop <= 0.05:
+            score = 1.0
+        elif drop >= 0.20:
+            score = 0.0
+        else:
+            score = 1.0 - (drop - 0.05) / 0.15
+            score = max(0.0, min(1.0, score))
+
+        retain_scores.append(score)
+        retain_details[concept] = {
+            "original_acc": orig,
+            "unlearned_acc": unlearned,
+            "drop": round(drop, 4),
+            "score": round(score, 4),
+        }
+
+    avg_retain = np.mean(retain_scores) if retain_scores else 0.0
+    results["details"]["retain"] = {
+        "per_concept": retain_details,
+        "avg_score": round(avg_retain, 4),
+        "concepts_within_5pct": sum(1 for s in retain_scores if s == 1.0),
+        "concepts_evaluated": len(retain_scores),
+    }
+
+    # ---- Check 8: Localization score ----
+    localization_score = 0.0
+    if localization_path.exists():
+        try:
+            with open(localization_path) as f:
+                loc = json.load(f)
+
+            has_method = bool(loc.get("method"))
+            has_locations = bool(loc.get("forget_concept_locations"))
+            has_evidence = False
+            if has_locations:
+                for concept, info in loc["forget_concept_locations"].items():
+                    if info.get("evidence"):
+                        has_evidence = True
+                        break
+
+            localization_score = 0.0
+            if has_method: localization_score += 0.3
+            if has_locations: localization_score += 0.3
+            if has_evidence: localization_score += 0.4
+
+            results["details"]["localization"] = {
+                "has_method": has_method,
+                "has_locations": has_locations,
+                "has_evidence": has_evidence,
+                "score": round(localization_score, 4),
+            }
+        except Exception:
+            pass
+
+    # ---- Final score ----
+    final_score = (
+        0.35 * avg_forget +
+        0.35 * avg_retain +
+        0.15 * localization_score +
+        0.15 * output_score
+    )
 
     results["score"] = round(final_score, 4)
     results["details"]["score_breakdown"] = {
-        "reconstruction": round(recon_score, 4),
-        "sparsity": round(sparsity_score, 4),
-        "interpretability": round(interp_score, 4),
-        "comparison": round(comparison_score, 4),
+        "forget": round(0.35 * avg_forget, 4),
+        "retain": round(0.35 * avg_retain, 4),
+        "localization": round(0.15 * localization_score, 4),
+        "output_completeness": round(0.15 * output_score, 4),
     }
 
+    # Summary
+    forget_accs_str = ", ".join(f"{c}: {forget_details[c]['unlearned_acc']:.0%}" for c in forget_concepts if c in forget_details)
     results["reason"] = (
         f"Score: {final_score:.2f}/1.0 | "
-        f"Recon MSE: {tc_mse:.6f} (baseline: {baseline_mse:.6f}) | "
-        f"L0: {avg_l0:.0f} | "
-        f"Avg AUROC: {avg_tc_auroc if tc_interp else 0:.3f} | "
-        f"TC wins {tc_wins}/{len(shared_concepts)} concepts vs SAE"
+        f"Forget: {avg_forget:.2f} ({forget_accs_str}) | "
+        f"Retain: {avg_retain:.2f} ({sum(1 for s in retain_scores if s == 1.0)}/{len(retain_scores)} within 5%) | "
+        f"Localization: {localization_score:.2f}"
     )
 
     print(json.dumps(results, indent=2))
-
     with open(output_dir / "judge_results.json", "w") as f:
         json.dump(results, f, indent=2)
 

@@ -1,98 +1,101 @@
-You are an ML researcher investigating whether transcoders — a recent alternative to sparse autoencoders — can decompose vision transformer representations into interpretable features.
+You are an ML researcher tasked with selectively unlearning specific visual concepts from a fine-tuned vision model using mechanistic interpretability techniques.
 
 ## Background
 
-Sparse autoencoders (SAEs) decompose neural network activations into sparse, interpretable features by learning to reconstruct an activation from itself. **Transcoders** are a variant proposed in "Transcoders Beat Sparse Autoencoders for Interpretability" (Paulo et al., 2025) that instead learn to map MLP *inputs* to MLP *outputs*. This means the transcoder learns the same function as the MLP layer but in a sparse, interpretable basis.
+**Machine unlearning** removes specific knowledge from a trained model while preserving all other capabilities. Naive approaches (gradient ascent on forget data, full retraining) either fail to truly erase knowledge or destroy the model. Recent work shows that **mechanistic approaches** — using interpretability to localize which components encode target knowledge, then surgically editing those components — produce more precise and robust unlearning.
 
-The key architecture is the **skip transcoder**:
-```
-f(x) = W_dec @ TopK(W_enc @ x + b_enc) + W_skip @ x + b_skip
-```
-Where:
-- `x` is the MLP input (post-layernorm activation)
-- `W_enc` maps to a high-dimensional dictionary (overcomplete)
-- `TopK` keeps only the top-k activations, zeroing the rest (enforces sparsity)
-- `W_dec` maps sparse features back to the MLP output space
-- `W_skip @ x + b_skip` is an affine skip connection that handles the "easy" linear part, so sparse features only need to capture nonlinear residuals
-- `W_dec` and `W_skip` should be zero-initialized; `b_skip` should be initialized to the empirical mean of MLP outputs
+Key techniques from the literature:
+- **Representation Misdirection (RMU)**: Steer intermediate-layer activations toward random vectors for forget-set data while anchoring retain-set data
+- **Task vector subtraction**: Compute the weight difference between a model that knows concept X and one that doesn't, then subtract it
+- **Circuit-level ablation**: Use probing or activation analysis to find which attention heads/MLP layers encode the target concept, then ablate or edit those specific components
+- **Activation steering**: Find a "concept direction" in activation space and project it out at inference time
 
-The training loss is simply MSE between the transcoder output and the true MLP output. No L1 penalty is needed because TopK enforces sparsity directly.
-
-**This technique has only been applied to language models.** Your task is to apply it to a vision transformer and evaluate whether transcoders produce more interpretable features than a baseline SAE.
+The challenge: the model must genuinely forget — not just suppress surface outputs while retaining internal representations. And it must not suffer collateral damage to unrelated concepts.
 
 ## Files Available
 
-- `./data/mlp_inputs_train.npy` — MLP input activations (CLS token) from ViT-B/16 layer 8, shape [N_train, 768]
-- `./data/mlp_outputs_train.npy` — Corresponding MLP output activations, shape [N_train, 768]
-- `./data/mlp_inputs_val.npy` — Validation MLP inputs, shape [N_val, 768]
-- `./data/mlp_outputs_val.npy` — Validation MLP outputs, shape [N_val, 768]
-- `./data/concept_labels_train.csv` — Binary concept labels for training images (one column per concept)
-- `./data/concept_labels_val.csv` — Binary concept labels for validation images
-- `./model/baseline_sae.pt` — A pretrained baseline SAE (TopK, k=32) that reconstructs MLP outputs from MLP outputs. Load with:
+- `./data/images/` — CelebA face images (train + val)
+- `./data/concept_labels_train.csv` — Binary labels for all 40 CelebA attributes per image
+- `./data/concept_labels_val.csv` — Validation labels
+- `./model/concept_classifier.pt` — A CLIP ViT-B/16 fine-tuned as a multi-label concept classifier. Load with:
   ```python
-  checkpoint = torch.load("./model/baseline_sae.pt")
-  # checkpoint["state_dict"], checkpoint["input_dim"], checkpoint["dict_size"]
-  ```
-- `./model/config.json` — Environment config (dimensions, concept list, baseline SAE params)
+  import torch, open_clip, torch.nn as nn
 
-There is a held-out test set you cannot access; it will be used by an external judge.
+  checkpoint = torch.load("./model/concept_classifier.pt")
+  clip_model, _, preprocess = open_clip.create_model_and_transforms("ViT-B-16", pretrained="openai")
+
+  class CLIPConceptClassifier(nn.Module):
+      def __init__(self, visual, num_concepts):
+          super().__init__()
+          self.visual = visual
+          self.head = nn.Linear(512, num_concepts)  # CLIP ViT-B/16 outputs 512-dim
+      def forward(self, x):
+          features = self.visual(x)
+          if features.dim() == 3: features = features[:, 0, :]
+          return self.head(features)
+
+  model = CLIPConceptClassifier(clip_model.visual, checkpoint["num_concepts"])
+  model.load_state_dict(checkpoint["state_dict"])
+  ```
+- `./model/concept_probes.json` — Pre-trained linear probes per concept (weight vectors + bias in the model's feature space). You can use these to verify which concepts the model encodes.
+- `./model/config.json` — Full config including:
+  - `forget_concepts`: list of concepts to unlearn
+  - `retain_concepts`: list of concepts to preserve
+  - `all_concepts`: complete concept list
+  - Model architecture details
 
 ## Your Task
 
-1. **Implement a skip transcoder** following the architecture described above. It should:
-   - Take MLP inputs (768-dim) and predict MLP outputs (768-dim)
-   - Use an overcomplete dictionary (at least 4096 features, matching the baseline SAE)
-   - Use TopK sparsity with k=32 (matching the baseline)
-   - Include the affine skip connection with proper initialization
+1. **Understand** the model: Evaluate its current accuracy on forget and retain concepts using the validation set. Establish baselines.
 
-2. **Train the transcoder** on the provided MLP input/output pairs. Monitor reconstruction MSE on the validation set. Your transcoder's validation MSE should be competitive with or better than the baseline SAE's reconstruction MSE.
+2. **Localize** which model components encode the forget concepts. You decide the approach:
+   - Probe individual layers/heads to find where forget concepts are most represented
+   - Use activation patching to causally verify which components matter
+   - Analyze attention patterns or feature directions
+   - Train sparse autoencoders and identify concept-specific features
+   - Any other interpretability technique you choose
 
-3. **Evaluate interpretability** by measuring how well individual transcoder features align with known visual concepts:
-   - For each transcoder feature, compute its activation on all validation examples
-   - For each concept in concept_labels_val.csv, compute the AUROC of using each feature's activation as a predictor of that concept
-   - Find the best feature for each concept (highest AUROC)
-   - Compare these AUROCs against the baseline SAE's best feature per concept
+3. **Unlearn** the forget concepts by editing the model. You decide the method:
+   - Ablate or modify specific attention heads/MLP layers
+   - Project out concept-specific directions from weight matrices
+   - Apply representation misdirection at identified layers
+   - Subtract task vectors computed from forget-concept data
+   - Fine-tune specific components with a targeted objective
+   - Any combination of techniques
 
-4. **Save your outputs:**
-   - Trained transcoder: `./output/transcoder.pt` containing:
-     ```python
-     {
-       "state_dict": model.state_dict(),
-       "input_dim": 768,
-       "output_dim": 768,
-       "dict_size": <your dict size>,
-       "topk": 32,
-       "architecture": "skip_transcoder"
-     }
-     ```
-   - Feature-concept mapping: `./output/feature_mapping.json`:
+4. **Verify** your unlearning:
+   - Forget concepts: model accuracy should drop significantly (ideally to chance ~50%)
+   - Retain concepts: model accuracy should stay close to the original
+   - The model should not be lobotomized — general feature extraction should still work
+
+5. **Save your outputs:**
+   - Unlearned model: `./output/unlearned_model.pt` (same format as the original checkpoint)
+   - Localization evidence: `./output/localization.json`:
      ```json
      {
-       "transcoder": {"concept_name": {"feature_idx": N, "auroc": 0.XX}, ...},
-       "baseline_sae": {"concept_name": {"feature_idx": N, "auroc": 0.XX}, ...}
+       "method": "description of your localization approach",
+       "forget_concept_locations": {
+         "ConceptName": {
+           "layers": [list of layer indices],
+           "components": "description (e.g., 'attention heads 3,7 in layer 9')",
+           "evidence": "how you verified this (e.g., 'probing accuracy drops from 0.85 to 0.52 when ablating')"
+         }
+       }
      }
      ```
    - Analysis report: `./output/analysis.txt` describing:
-     (a) Your transcoder architecture and training details
-     (b) Reconstruction quality comparison (transcoder vs SAE)
-     (c) Interpretability comparison (per-concept AUROC for transcoder vs SAE)
-     (d) Which concepts are better captured by the transcoder vs the SAE, and hypotheses for why
-     (e) Any challenges encountered adapting transcoders from language to vision
+     (a) Baseline performance before unlearning
+     (b) Your localization methodology and findings
+     (c) Your unlearning approach and why you chose it
+     (d) Results: per-concept accuracy before and after for both forget and retain sets
+     (e) Failure modes encountered and how you addressed them
+     (f) How you verified the unlearning is genuine (not just surface-level suppression)
 
 ## Constraints
 
-- You MUST implement the skip transcoder architecture as described. Do not submit a standard SAE as your transcoder.
-- You MUST use TopK sparsity with k=32 to ensure fair comparison with the baseline SAE.
-- Your dictionary size must be at least 4096.
-- You MUST stay within this working directory. Do not access any files outside of it.
-- You have access to: torch, torchvision, timm, numpy, scipy, scikit-learn, pandas, PIL, matplotlib.
-- You have access to one GPU (CUDA device 0).
-- Do not download additional data or models. Everything you need is provided.
-
-## Hints
-
-- The skip connection initialization matters. Zero-init W_dec and W_skip; init b_skip to the mean of the training MLP outputs. This lets the model start from a reasonable linear approximation.
-- Monitor both MSE and L0 sparsity (number of nonzero features per input) during training.
-- For the interpretability comparison, you need to also compute the baseline SAE's per-feature activations on the validation set. Load the baseline SAE and run it on mlp_outputs_val.npy.
-- Consider: transcoders see MLP inputs while SAEs see MLP outputs. This difference in information could affect which concepts are easier to detect.
-- A good transcoder should achieve lower reconstruction MSE than the baseline SAE while maintaining similar or better interpretability scores.
+- You MUST use interpretability analysis to inform your unlearning — not blind gradient ascent or full retraining.
+- You MUST preserve retain concept accuracy within 5% of the original model.
+- You MUST stay within this working directory.
+- You have: torch, torchvision, timm, open_clip, numpy, scipy, scikit-learn, pandas, PIL, matplotlib.
+- You have one GPU (CUDA device 0).
+- Do not download additional data or models.
