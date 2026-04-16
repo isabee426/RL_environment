@@ -1,57 +1,98 @@
-You are an ML researcher tasked with fixing a biased vision model using mechanistic interpretability.
+You are an ML researcher investigating whether transcoders — a recent alternative to sparse autoencoders — can decompose vision transformer representations into interpretable features.
 
 ## Background
 
-A ViT-B/16 model has been fine-tuned on a bird classification task (waterbird vs. landbird). The training data contains a spurious correlation: 95% of waterbirds appear on water backgrounds, and 95% of landbirds appear on land backgrounds. As a result, the model partly relies on background features rather than bird features for classification. It achieves high average accuracy but performs poorly on minority groups (waterbirds on land, landbirds on water).
+Sparse autoencoders (SAEs) decompose neural network activations into sparse, interpretable features by learning to reconstruct an activation from itself. **Transcoders** are a variant proposed in "Transcoders Beat Sparse Autoencoders for Interpretability" (Paulo et al., 2025) that instead learn to map MLP *inputs* to MLP *outputs*. This means the transcoder learns the same function as the MLP layer but in a sparse, interpretable basis.
+
+The key architecture is the **skip transcoder**:
+```
+f(x) = W_dec @ TopK(W_enc @ x + b_enc) + W_skip @ x + b_skip
+```
+Where:
+- `x` is the MLP input (post-layernorm activation)
+- `W_enc` maps to a high-dimensional dictionary (overcomplete)
+- `TopK` keeps only the top-k activations, zeroing the rest (enforces sparsity)
+- `W_dec` maps sparse features back to the MLP output space
+- `W_skip @ x + b_skip` is an affine skip connection that handles the "easy" linear part, so sparse features only need to capture nonlinear residuals
+- `W_dec` and `W_skip` should be zero-initialized; `b_skip` should be initialized to the empirical mean of MLP outputs
+
+The training loss is simply MSE between the transcoder output and the true MLP output. No L1 penalty is needed because TopK enforces sparsity directly.
+
+**This technique has only been applied to language models.** Your task is to apply it to a vision transformer and evaluate whether transcoders produce more interpretable features than a baseline SAE.
 
 ## Files Available
 
-- `/model/vit_waterbirds.pt` — Fine-tuned ViT-B/16 checkpoint. Load with:
+- `./data/mlp_inputs_train.npy` — MLP input activations (CLS token) from ViT-B/16 layer 8, shape [N_train, 768]
+- `./data/mlp_outputs_train.npy` — Corresponding MLP output activations, shape [N_train, 768]
+- `./data/mlp_inputs_val.npy` — Validation MLP inputs, shape [N_val, 768]
+- `./data/mlp_outputs_val.npy` — Validation MLP outputs, shape [N_val, 768]
+- `./data/concept_labels_train.csv` — Binary concept labels for training images (one column per concept)
+- `./data/concept_labels_val.csv` — Binary concept labels for validation images
+- `./model/baseline_sae.pt` — A pretrained baseline SAE (TopK, k=32) that reconstructs MLP outputs from MLP outputs. Load with:
   ```python
-  import timm, torch
-  checkpoint = torch.load("/model/vit_waterbirds.pt")
-  model = timm.create_model(checkpoint["model_name"], pretrained=False,
-                             num_classes=checkpoint["num_classes"])
-  model.load_state_dict(checkpoint["model_state_dict"])
+  checkpoint = torch.load("./model/baseline_sae.pt")
+  # checkpoint["state_dict"], checkpoint["input_dim"], checkpoint["dict_size"]
   ```
-- `/model/config.json` — Model config (architecture, class names, group definitions, normalization stats)
-- `/data/waterbirds/metadata.csv` — Columns: `filename`, `label` (0=landbird, 1=waterbird), `background` (0=land, 1=water), `split` (train/val)
-- `/data/waterbirds/images/` — Image files referenced by metadata.csv
+- `./model/config.json` — Environment config (dimensions, concept list, baseline SAE params)
 
-You only have access to train and val splits. The test split is held out and used by an external judge.
+There is a held-out test set you cannot access; it will be used by an external judge.
 
 ## Your Task
 
-1. **Analyze** the model's internal representations to identify which attention heads and/or MLP layers encode the spurious background feature vs. the true bird feature. Use techniques such as:
-   - Linear probing on per-head or per-layer outputs
-   - Activation patching / causal ablation (swap activations between images with same bird but different background)
-   - Attention pattern analysis across groups
+1. **Implement a skip transcoder** following the architecture described above. It should:
+   - Take MLP inputs (768-dim) and predict MLP outputs (768-dim)
+   - Use an overcomplete dictionary (at least 4096 features, matching the baseline SAE)
+   - Use TopK sparsity with k=32 (matching the baseline)
+   - Include the affine skip connection with proper initialization
 
-2. **Intervene** surgically on the model to reduce its reliance on the background feature. Valid interventions include:
-   - Ablating specific attention heads (zero out their output)
-   - Projecting out a spurious linear direction from specific head/layer outputs
-   - Fine-tuning ONLY the identified problematic heads on a group-balanced subset (you may construct this from the training data)
-   - Any other targeted edit that modifies specific components
+2. **Train the transcoder** on the provided MLP input/output pairs. Monitor reconstruction MSE on the validation set. Your transcoder's validation MSE should be competitive with or better than the baseline SAE's reconstruction MSE.
 
-3. **Save your outputs:**
-   - Modified model: `/output/model_fixed.pt` (same format as the original checkpoint)
-   - Analysis report: `/output/analysis.txt` describing:
-     (a) Which components encode the spurious feature and how you identified them
-     (b) What intervention you applied and why
-     (c) Validation accuracy before and after, broken down by group
+3. **Evaluate interpretability** by measuring how well individual transcoder features align with known visual concepts:
+   - For each transcoder feature, compute its activation on all validation examples
+   - For each concept in concept_labels_val.csv, compute the AUROC of using each feature's activation as a predictor of that concept
+   - Find the best feature for each concept (highest AUROC)
+   - Compare these AUROCs against the baseline SAE's best feature per concept
+
+4. **Save your outputs:**
+   - Trained transcoder: `./output/transcoder.pt` containing:
+     ```python
+     {
+       "state_dict": model.state_dict(),
+       "input_dim": 768,
+       "output_dim": 768,
+       "dict_size": <your dict size>,
+       "topk": 32,
+       "architecture": "skip_transcoder"
+     }
+     ```
+   - Feature-concept mapping: `./output/feature_mapping.json`:
+     ```json
+     {
+       "transcoder": {"concept_name": {"feature_idx": N, "auroc": 0.XX}, ...},
+       "baseline_sae": {"concept_name": {"feature_idx": N, "auroc": 0.XX}, ...}
+     }
+     ```
+   - Analysis report: `./output/analysis.txt` describing:
+     (a) Your transcoder architecture and training details
+     (b) Reconstruction quality comparison (transcoder vs SAE)
+     (c) Interpretability comparison (per-concept AUROC for transcoder vs SAE)
+     (d) Which concepts are better captured by the transcoder vs the SAE, and hypotheses for why
+     (e) Any challenges encountered adapting transcoders from language to vision
 
 ## Constraints
 
-- You MUST NOT reinitialize or retrain the full model from scratch.
-- You MUST NOT fine-tune more than 10% of total model parameters.
-- Your intervention must be informed by interpretability analysis — not random ablation or brute-force search over all heads.
+- You MUST implement the skip transcoder architecture as described. Do not submit a standard SAE as your transcoder.
+- You MUST use TopK sparsity with k=32 to ensure fair comparison with the baseline SAE.
+- Your dictionary size must be at least 4096.
 - You MUST stay within this working directory. Do not access any files outside of it.
 - You have access to: torch, torchvision, timm, numpy, scipy, scikit-learn, pandas, PIL, matplotlib.
 - You have access to one GPU (CUDA device 0).
+- Do not download additional data or models. Everything you need is provided.
 
 ## Hints
 
-- The model is a standard `timm` ViT-B/16 with 12 layers, 12 heads per layer, hidden dim 768.
-- A good starting point: extract CLS token attention patterns or per-head output representations for images across the 4 groups, then check which heads differentiate by background vs. by bird type.
-- For causal analysis: take pairs of images with the same bird type but different backgrounds. Patch activations from one into the other at specific heads and see how predictions change.
-- Even partial debiasing is valuable — you don't need a perfect solution.
+- The skip connection initialization matters. Zero-init W_dec and W_skip; init b_skip to the mean of the training MLP outputs. This lets the model start from a reasonable linear approximation.
+- Monitor both MSE and L0 sparsity (number of nonzero features per input) during training.
+- For the interpretability comparison, you need to also compute the baseline SAE's per-feature activations on the validation set. Load the baseline SAE and run it on mlp_outputs_val.npy.
+- Consider: transcoders see MLP inputs while SAEs see MLP outputs. This difference in information could affect which concepts are easier to detect.
+- A good transcoder should achieve lower reconstruction MSE than the baseline SAE while maintaining similar or better interpretability scores.
