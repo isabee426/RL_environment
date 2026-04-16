@@ -72,11 +72,8 @@ The environment includes a behavioral analysis pipeline that characterizes the a
 - **Research quality signals** — does it state hypotheses, compare baselines, discuss limitations?
 - **Error recovery** — how does it handle failures?
 
-- Here is Run 2's full behavioral analysis:
-- Loading trajectory...
-Running behavioral analysis...
-Report saved to /data3/ishaplan/pref_model_env/results/behavioral_analysis.md
-Structured data saved to /data3/ishaplan/pref_model_env/results/behavioral_analysis.json
+## Here is Run 2's full behavioral analysis:
+
 
 # Agent Behavioral Analysis Report
 
