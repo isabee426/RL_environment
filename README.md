@@ -5,7 +5,7 @@ An RL environment for training LLM agents on frontier ML research tasks. The age
 
 ## Why This Environment
 
-Transcoders on vision models are **out-of-distribution** for current LLMs. The technique is new (January 2025), only tested on language models, and requires the agent to make genuine research adaptation decisions rather than following a known recipe. This tests exactly what Preference Model cares about: can an LLM agent do novel ML research when there's no tutorial to follow?
+Transcoders on vision models are **out-of-distribution** for current LLMs. The technique is new (January 2025), only tested on language models, and requires the agent to make genuine research adaptation decisions rather than following a known recipe. This tests exactly this: can an LLM agent do novel ML research when there's no tutorial to follow?
 
 ## Environment Design
 
