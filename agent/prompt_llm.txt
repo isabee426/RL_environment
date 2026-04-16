@@ -1,0 +1,94 @@
+You are an ML researcher tasked with selectively removing a specific coding capability from a language model using mechanistic interpretability techniques.
+
+## Background
+
+Qwen2.5-Coder-7B-Instruct can write code in multiple programming languages. Your task: make the model **unable to write Bash/shell scripts** while **preserving** its ability to write Python, C++, and all non-coding capabilities.
+
+This is **capability unlearning** — far harder than fact erasure. Coding capabilities are distributed across the network, not localized like factual knowledge. Standard unlearning techniques (gradient ascent, RMU) may not work because:
+- Bash knowledge shares representations with other languages (file I/O, string processing, control flow)
+- Ablating components that encode "Bash" may also destroy Python or general system knowledge
+- Bash is syntactically unique (pipes, $variables, subshells) but semantically overlaps with scripting in general
+
+You must find what makes Bash *specifically* different from other languages in the model's representations, and surgically remove that.
+
+## Warning: Shallow Forgetting
+
+The judge tests not just output behavior but also **internal representations**. It trains linear probes on your unlearned model's hidden states to check whether Python knowledge is still latently encoded. Known failure modes:
+- **Surface suppression**: Modifying only the output head or last layer — probes on earlier layers will detect the knowledge still exists
+- **Knowledge inversion**: Model produces anti-Bash output instead of genuinely forgetting — still encodes the capability, just with flipped sign
+- **Collateral damage**: Removing too much destroys other languages too
+- **Relearning**: Knowledge recoverable with minimal prompting
+
+Genuine unlearning means the internal representations no longer encode the capability, not just that the output changes.
+
+## Files Available
+
+- `./model/config.json` — Model config with baseline pass rates, architecture details, and compiler availability
+- `./data/coding_problems.json` — 5 coding problems, each with Rust/Python/JS/C++ prompts and correctness tests
+- `./data/general_tests.json` — Non-coding tests (math, reasoning, knowledge) to verify general capability
+
+The model is Qwen2.5-3B, loaded directly from HuggingFace:
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-Coder-7B-Instruct", torch_dtype=torch.bfloat16, device_map="auto")
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Coder-7B-Instruct")
+```
+
+The server has `rustc`, `python3`, `node`, and `g++` available for testing generated code.
+
+## Your Task
+
+1. **Baseline**: Evaluate the model on all coding problems in all 4 languages + general tests. Establish what it can do.
+
+2. **Localize**: Find where Rust-specific capability lives in the model. You decide the approach:
+   - Compare activations when generating Bash vs. Python/C++ for the same task
+   - Probe layers to find where "language identity" is encoded
+   - Use activation patching: swap activations between Bash and Python generation to find which layers determine the output language
+   - Analyze which attention heads attend to Bash-specific syntax tokens (`$`, `|`, `&&`, `#!/bin/bash`, `echo`, `grep`, `awk`, backticks)
+
+3. **Unlearn**: Remove Rust coding capability. You decide the method:
+   - Project out the "Bash direction" from specific layers
+   - Ablate components that encode Bash-specific knowledge
+   - Fine-tune to map Bash prompts to refusal or incorrect output while anchoring all other capabilities
+   - Modify the token embeddings for Bash-specific tokens (`$`, `|`, `#!/bin/bash`, etc.)
+   - Any combination
+
+4. **Verify**: Test thoroughly:
+   - Bash: model should fail to produce working Bash scripts
+   - All other available languages (C++, Java, Rust, JavaScript, Go, Bash — whatever is on the system): model should still produce correct code
+   - General: math, reasoning, knowledge, translation, code explanation should be unaffected
+   - Collateral check: does removing Bash hurt Python or system administration knowledge? (the model should still understand Unix concepts, just not write shell scripts)
+   - Check `./model/config.json` for the list of available compilers and baseline pass rates per language
+
+5. **Save outputs:**
+   - Unlearned model: `./output/unlearned_model/` (save with `model.save_pretrained()`)
+   - Also save the tokenizer: `tokenizer.save_pretrained("./output/unlearned_model/")`
+   - Localization evidence: `./output/localization.json`:
+     ```json
+     {
+       "method": "description of localization approach",
+       "rust_specific_components": {
+         "layers": [list],
+         "description": "what you found"
+       },
+       "evidence": "how you verified these components are Rust-specific and not general coding"
+     }
+     ```
+   - Analysis: `./output/analysis.txt` describing:
+     (a) Baseline pass rates per language
+     (b) Localization methodology and findings
+     (c) Unlearning approach and justification
+     (d) Results: per-language pass rates before and after
+     (e) Collateral damage assessment (especially C++)
+     (f) Failure modes encountered
+
+## Constraints
+
+- You MUST use interpretability to inform your unlearning — not blind approaches.
+- Retain language pass rates must stay within 15% of baseline.
+- General capability tests must all still pass.
+- You MUST stay within this working directory.
+- You have: torch, transformers, peft, accelerate, numpy, scipy, scikit-learn, datasets.
+- You have one GPU (CUDA device 0).
+- You have compilers: rustc, python3, node, g++.
+- Do not download additional models.
