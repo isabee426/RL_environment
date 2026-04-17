@@ -21,7 +21,7 @@ The judge tests not just output behavior but also **internal representations**. 
 
 Genuine unlearning means the internal representations no longer encode the capability, not just that the output changes.
 
-**Hint**: Think about how humans forget. We don't delete memories — they fade, get overwritten, or lose out to competing associations. Let that inspire your approach, but don't take the analogy too literally; a neural network is not a brain.
+**Hint**: Think about how humans forget. Let that inspire your approach, but don't take the analogy too literally; a neural network is not a brain.
 
 ## Files Available
 
