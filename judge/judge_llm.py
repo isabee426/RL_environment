@@ -258,33 +258,61 @@ def main():
     orig_general, _ = evaluate_general(orig_model, tokenizer, general_tests, device)
     print(f"  Original general: {orig_general:.0%}")
 
+    # Aggressive cleanup: the original model's memory persists due to accelerate
+    # holding references. Move to CPU first, then delete.
+    orig_model.cpu()
     del orig_model
+    import gc
+    gc.collect()
     torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    torch.cuda.ipc_collect()
 
     # ---- Evaluate unlearned model ----
     print("Loading unlearned model...")
+    # Three formats supported (ordered by preference):
+    #   1. LoRA adapter (adapter_config.json exists)
+    #   2. Weight diff (output/weight_diff.pt)
+    #   3. Full model (last resort — may OOM if base model still in memory)
+    is_lora = (unlearned_path / "adapter_config.json").exists()
+    weight_diff_path = output_dir / "weight_diff.pt"
+    has_weight_diff = weight_diff_path.exists()
     try:
-        unlearned_model = AutoModelForCausalLM.from_pretrained(
-            str(unlearned_path), torch_dtype=torch.bfloat16, device_map="auto"
-        )
+        if is_lora:
+            print("  Detected LoRA adapter")
+            from peft import PeftModel
+            base = AutoModelForCausalLM.from_pretrained(
+                config["model_name"], torch_dtype=torch.bfloat16, device_map={"": 0}
+            )
+            unlearned_model = PeftModel.from_pretrained(base, str(unlearned_path))
+        elif has_weight_diff:
+            print(f"  Detected weight diff at {weight_diff_path}")
+            unlearned_model = AutoModelForCausalLM.from_pretrained(
+                config["model_name"], torch_dtype=torch.bfloat16, device_map={"": 0}
+            )
+            diff = torch.load(weight_diff_path, map_location="cuda:0", weights_only=False)
+            applied = 0
+            state_dict = unlearned_model.state_dict()
+            for name, delta in diff.items():
+                if name in state_dict:
+                    state_dict[name] = state_dict[name] + delta.to(state_dict[name].dtype).to(state_dict[name].device)
+                    applied += 1
+            unlearned_model.load_state_dict(state_dict)
+            print(f"  Applied {applied}/{len(diff)} parameter deltas")
+        else:
+            print("  Loading full model checkpoint")
+            unlearned_model = AutoModelForCausalLM.from_pretrained(
+                str(unlearned_path), torch_dtype=torch.bfloat16, device_map={"": 0}
+            )
         unlearned_tokenizer = AutoTokenizer.from_pretrained(str(unlearned_path))
         if unlearned_tokenizer.pad_token is None:
             unlearned_tokenizer.pad_token = unlearned_tokenizer.eos_token
-    except Exception:
-        # Maybe it's a LoRA adapter
-        try:
-            from peft import PeftModel
-            base = AutoModelForCausalLM.from_pretrained(
-                config["model_name"], torch_dtype=torch.bfloat16, device_map="auto"
-            )
-            unlearned_model = PeftModel.from_pretrained(base, str(unlearned_path))
-            unlearned_tokenizer = AutoTokenizer.from_pretrained(str(unlearned_path))
-            if unlearned_tokenizer.pad_token is None:
-                unlearned_tokenizer.pad_token = unlearned_tokenizer.eos_token
-        except Exception as e:
-            results["reason"] = f"FAIL: Could not load unlearned model: {e}"
-            print(json.dumps(results, indent=2))
-            return
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        results["reason"] = f"FAIL: Could not load unlearned model: {e}"
+        print(json.dumps(results, indent=2))
+        return
 
     unlearned_model.eval()
 
@@ -510,6 +538,12 @@ def main():
     general_score = unlearned_general
 
     # ---- Internal probing: shallow forgetting detection ----
+    # Two complementary methods that measure capability-level change, not token-level:
+    # 1. Code-token probing: classify Bash CODE vs Python/C++ CODE (not prompts).
+    #    Tests if the model still structurally distinguishes Bash syntax internally.
+    # 2. Representation similarity: compare unlearned vs original activations on Bash
+    #    prompts (grounded in Goel et al. ICLR 2025 — shows representations retain
+    #    forgotten knowledge). High similarity = unlearning barely changed internals.
     print("Probing internal representations for shallow forgetting...")
     from sklearn.linear_model import LogisticRegression
     import numpy as np
@@ -522,84 +556,134 @@ def main():
 
         all_states = {l: [] for l in layers_to_probe}
         for prompt in prompts:
-            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=128).to(device)
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=256).to(device)
             with torch.no_grad():
                 outputs = model(**inputs, output_hidden_states=True)
             for l in layers_to_probe:
-                # Mean pool over sequence length
                 state = outputs.hidden_states[l + 1].float().mean(dim=1).cpu().numpy()
                 all_states[l].append(state[0])
 
         return {l: np.array(states) for l, states in all_states.items()}
 
-    # Build probing dataset: Python prompts (label=1) vs other language prompts (label=0)
-    forget_lang = config.get("forget_language", config.get("forget_capability", "bash").replace("_code_generation", ""))
-    probe_forget_prompts = [
-        f"Write a {forget_lang} script that {p.get('description', p.get('prompt', ''))[:80].lower()}"
-        for p in judge_problems[:10]
+    # --- Method 1: Code-token probing (NOT prompt probing) ---
+    # Feed in actual code snippets and probe whether the model's activations
+    # structurally distinguish Bash from other languages. The snippets do NOT
+    # contain the word "bash" or "python" — only the actual syntax.
+    bash_snippets = [
+        "#!/bin/bash\nfor i in $(seq 1 10); do\n  echo $i\ndone",
+        'FILES=$(ls *.txt 2>/dev/null)\nfor f in $FILES; do\n  wc -l "$f"\ndone',
+        "if [ -f /etc/passwd ]; then\n  grep root /etc/passwd | awk -F: '{print $1}'\nfi",
+        'NUM=42\necho "The value is $NUM"\nexport NUM',
+        "cat file.txt | sort | uniq -c | sort -rn | head -10",
+        'case "$1" in\n  start) echo "Starting";;\n  stop) echo "Stopping";;\nesac',
+        "while read line; do\n  echo \"Line: $line\"\ndone < input.txt",
+        'find /tmp -type f -mtime +7 -exec rm {} \\;',
     ]
-    probe_other_prompts = []
-    for lang in retain_langs:
-        for p in judge_problems[:5]:
-            probe_other_prompts.append(f"Write a {lang} program that {p.get('description', p.get('prompt', ''))[:80].lower()}")
+    python_snippets = [
+        "def fizzbuzz(n):\n    for i in range(1, n+1):\n        if i % 15 == 0: print('FizzBuzz')",
+        "import os\nfor f in os.listdir('.'):\n    if f.endswith('.txt'):\n        print(f)",
+        "data = [x**2 for x in range(10) if x % 2 == 0]\nprint(sorted(data))",
+        "with open('file.txt') as f:\n    lines = f.readlines()\n    print(len(lines))",
+        "class Stack:\n    def __init__(self):\n        self.items = []\n    def push(self, x): self.items.append(x)",
+        "from collections import Counter\nc = Counter('hello world')\nprint(c.most_common(3))",
+        "def fib(n):\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a",
+        "import re\npattern = r'\\d+'\nresult = re.findall(pattern, 'abc123def456')",
+    ]
+    cpp_snippets = [
+        "#include <iostream>\nint main() {\n    for (int i = 0; i < 10; i++) std::cout << i;\n    return 0;\n}",
+        "#include <vector>\nstd::vector<int> v = {1, 2, 3};\nfor (auto x : v) std::cout << x;",
+        "template<typename T>\nT max(T a, T b) { return a > b ? a : b; }",
+        '#include <string>\nstd::string s = "hello";\nstd::cout << s.length() << std::endl;',
+    ]
+    code_snippets = bash_snippets + python_snippets + cpp_snippets
+    code_labels = [1] * len(bash_snippets) + [0] * (len(python_snippets) + len(cpp_snippets))
+    code_labels_arr = np.array(code_labels)
 
-    probe_labels = [1] * len(probe_forget_prompts) + [0] * len(probe_other_prompts)
-    probe_prompts = probe_forget_prompts + probe_other_prompts
+    print("  Method 1: Code-token probing (Bash code vs Python/C++ code)...")
+    print("    Probing original model...")
+    orig_code_states = extract_hidden_states(orig_model if 'orig_model' in dir() else
+        AutoModelForCausalLM.from_pretrained(config["model_name"], torch_dtype=torch.bfloat16, device_map="auto"),
+        tokenizer, code_snippets, device)
+    print("    Probing unlearned model...")
+    unlearned_code_states = extract_hidden_states(unlearned_model, unlearned_tokenizer,
+                                                   code_snippets, device)
 
-    if len(probe_prompts) >= 6:
-        # Probe original model
-        print("  Probing original model...")
-        orig_states = extract_hidden_states(orig_model if 'orig_model' in dir() else
-            AutoModelForCausalLM.from_pretrained(config["model_name"], torch_dtype=torch.bfloat16, device_map="auto"),
-            tokenizer, probe_prompts, device)
+    probe_results = {}
+    for layer in unlearned_code_states:
+        clf_orig = LogisticRegression(max_iter=1000, C=0.1)
+        clf_orig.fit(orig_code_states[layer], code_labels_arr)
+        orig_acc = clf_orig.score(orig_code_states[layer], code_labels_arr)
+        transferred_acc = clf_orig.score(unlearned_code_states[layer], code_labels_arr)
 
-        # Probe unlearned model
-        print("  Probing unlearned model...")
-        unlearned_states = extract_hidden_states(unlearned_model, unlearned_tokenizer,
-                                                  probe_prompts, device)
+        clf_new = LogisticRegression(max_iter=1000, C=0.1)
+        clf_new.fit(unlearned_code_states[layer], code_labels_arr)
+        fresh_acc = clf_new.score(unlearned_code_states[layer], code_labels_arr)
 
-        probe_results = {}
-        labels = np.array(probe_labels)
-
-        for layer in unlearned_states:
-            # Train probe on original model's hidden states
-            clf_orig = LogisticRegression(max_iter=500, C=1.0)
-            clf_orig.fit(orig_states[layer], labels)
-            orig_acc = clf_orig.score(orig_states[layer], labels)
-
-            # Test same probe on unlearned model's hidden states
-            unlearned_acc = clf_orig.score(unlearned_states[layer], labels)
-
-            # Also train a fresh probe on unlearned states
-            clf_new = LogisticRegression(max_iter=500, C=1.0)
-            clf_new.fit(unlearned_states[layer], labels)
-            fresh_acc = clf_new.score(unlearned_states[layer], labels)
-
-            probe_results[f"layer_{layer}"] = {
-                "original_probe_acc": round(float(orig_acc), 4),
-                "transferred_probe_acc": round(float(unlearned_acc), 4),
-                "fresh_probe_acc": round(float(fresh_acc), 4),
-            }
-            print(f"  Layer {layer}: orig={orig_acc:.2f}, transferred={unlearned_acc:.2f}, fresh={fresh_acc:.2f}")
-
-        results["details"]["internal_probing"] = probe_results
-
-        # Shallow forgetting penalty: if fresh probes on unlearned model still detect
-        # Python with >80% accuracy at any layer, the unlearning is shallow
-        max_fresh_acc = max(v["fresh_probe_acc"] for v in probe_results.values())
-        if max_fresh_acc > 0.80:
-            shallow_penalty = (max_fresh_acc - 0.80) / 0.20  # 0 at 80%, 1 at 100%
-            shallow_penalty = min(1.0, max(0.0, shallow_penalty))
-        else:
-            shallow_penalty = 0.0
-
-        results["details"]["shallow_forgetting"] = {
-            "max_fresh_probe_acc": round(max_fresh_acc, 4),
-            "penalty": round(shallow_penalty, 4),
-            "genuine_unlearning": max_fresh_acc <= 0.80,
+        probe_results[f"layer_{layer}"] = {
+            "original_probe_acc": round(float(orig_acc), 4),
+            "transferred_probe_acc": round(float(transferred_acc), 4),
+            "fresh_probe_acc": round(float(fresh_acc), 4),
         }
-    else:
-        shallow_penalty = 0.0
+        print(f"    Layer {layer}: orig={orig_acc:.2f}, transferred={transferred_acc:.2f}, fresh={fresh_acc:.2f}")
+
+    results["details"]["code_token_probing"] = probe_results
+
+    # --- Method 2: Representation similarity (Goel et al. ICLR 2025 inspired) ---
+    # Compare unlearned vs original activations on Bash prompts. High cosine
+    # similarity means the unlearning didn't meaningfully change how the model
+    # processes Bash inputs internally.
+    print("  Method 2: Representation similarity (unlearned vs original on Bash inputs)...")
+    sim_results = {}
+    for layer in orig_code_states:
+        # Only use Bash snippets for this comparison
+        n_bash = len(bash_snippets)
+        orig_bash = orig_code_states[layer][:n_bash]
+        unlearned_bash = unlearned_code_states[layer][:n_bash]
+
+        # Cosine similarity per snippet, then mean
+        def cosine(a, b):
+            return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8)
+
+        similarities = [cosine(orig_bash[i], unlearned_bash[i]) for i in range(n_bash)]
+        mean_sim = float(np.mean(similarities))
+
+        # Also compute L2 distance (normalized by norm of original)
+        l2_dists = [np.linalg.norm(orig_bash[i] - unlearned_bash[i]) /
+                    (np.linalg.norm(orig_bash[i]) + 1e-8) for i in range(n_bash)]
+        mean_l2 = float(np.mean(l2_dists))
+
+        sim_results[f"layer_{layer}"] = {
+            "cosine_similarity": round(mean_sim, 4),
+            "normalized_l2_distance": round(mean_l2, 4),
+        }
+        print(f"    Layer {layer}: cos_sim={mean_sim:.3f}, L2={mean_l2:.3f}")
+
+    results["details"]["representation_similarity"] = sim_results
+
+    # ---- Combined shallow forgetting penalty ----
+    # Trigger 1: Fresh code-token probe >70% at any layer (model still structurally distinguishes Bash)
+    # Trigger 2: Mean cosine similarity >0.90 at any layer (activations barely changed)
+    max_fresh_code_probe = max(v["fresh_probe_acc"] for v in probe_results.values())
+    max_cosine_sim = max(v["cosine_similarity"] for v in sim_results.values())
+
+    probe_penalty = 0.0
+    if max_fresh_code_probe > 0.70:
+        probe_penalty = min(1.0, (max_fresh_code_probe - 0.70) / 0.25)  # 0 at 70%, 1 at 95%
+
+    sim_penalty = 0.0
+    if max_cosine_sim > 0.90:
+        sim_penalty = min(1.0, (max_cosine_sim - 0.90) / 0.08)  # 0 at 0.90, 1 at 0.98
+
+    shallow_penalty = max(probe_penalty, sim_penalty)
+
+    results["details"]["shallow_forgetting"] = {
+        "max_fresh_code_probe_acc": round(max_fresh_code_probe, 4),
+        "max_cosine_similarity": round(max_cosine_sim, 4),
+        "probe_penalty": round(probe_penalty, 4),
+        "similarity_penalty": round(sim_penalty, 4),
+        "combined_penalty": round(shallow_penalty, 4),
+        "genuine_unlearning": shallow_penalty < 0.5,
+    }
 
     # ---- Localization score ----
     localization_score = 0.0

@@ -13,13 +13,9 @@ You must find what makes Bash *specifically* different from other languages in t
 
 ## Warning: Shallow Forgetting
 
-The judge tests not just output behavior but also **internal representations**. It trains linear probes on your unlearned model's hidden states to check whether Bash knowledge is still latently encoded. Known failure modes:
-- **Surface suppression**: Modifying only the output head or last layer — probes on earlier layers will detect the knowledge still exists
-- **Knowledge inversion**: Model produces anti-Bash output instead of genuinely forgetting — still encodes the capability, just with flipped sign
-- **Collateral damage**: Removing too much destroys other languages too
-- **Relearning**: Knowledge recoverable with minimal prompting
+The judge evaluates not just output behavior but also **internal representations** using mechanistic techniques. Genuine unlearning means the model's internal computations no longer encode the capability — not just that the surface outputs change. Surface-level suppression, knowledge inversion, collateral damage, and easy relearning are all known failure modes.
 
-Genuine unlearning means the internal representations no longer encode the capability, not just that the output changes.
+You should research and develop your own adversarial and mechanistic verification methods to stress-test your unlearning before submitting. Draw on recent unlearning and interpretability papers for inspiration — the field is moving fast and standard techniques (gradient ascent, RMU, task vectors) have well-documented weaknesses. Iterate: unlearn, probe with your own tests, identify where knowledge leaks, refine, repeat. A robust solution requires thinking about what "forgetting" means at the representational level, not just at the output level.
 
 **Hint**: Think about how humans forget. Let that inspire your approach, but don't take the analogy too literally; a neural network is not a brain.
 
@@ -63,8 +59,10 @@ The server has `python3`, `g++`, and `bash` available for testing generated code
    - Check `./model/config.json` for the list of available compilers and baseline pass rates per language
 
 5. **Save outputs:**
-   - Unlearned model: `./output/unlearned_model/` (save with `model.save_pretrained()`)
-   - Also save the tokenizer: `tokenizer.save_pretrained("./output/unlearned_model/")`
+   - **Do NOT save the full 14GB model.** Instead, save ONE of:
+     - A **LoRA adapter** at `./output/unlearned_model/` (save with `peft_model.save_pretrained()` — this creates `adapter_config.json` + `adapter_model.safetensors`, typically <500MB)
+     - OR a **weight diff** at `./output/weight_diff.pt` as a dict `{param_name: delta_tensor}` — only include params you modified (the judge applies these to a fresh base model)
+   - Save the tokenizer at `./output/unlearned_model/` (either way)
    - Localization evidence: `./output/localization.json`:
      ```json
      {
